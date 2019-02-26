@@ -14,15 +14,12 @@ The agent takes as input all of the features and outputs a policy across all 524
 """
 
 import threading
-import multiprocessing
 import psutil
 import numpy as np
 import tensorflow as tf
 import scipy.signal
 from time import sleep
 import os
-import json
-import pickle
 
 from pysc2.env import sc2_env
 from pysc2.env import environment
@@ -35,12 +32,12 @@ Use the following command to launch Tensorboard:
 tensorboard --logdir=worker_0:'./train_0',worker_1:'./train_1',worker_2:'./train_2',worker_3:'./train_3'
 """
 
-## HELPER FUNCTIONS
-
 
 # Copies one set of variables to another.
 # Used to set worker network parameters to those of global network.
 def update_target_graph(from_scope, to_scope):
+    """  Copies one set of variables to another.
+         Used to set worker network parameters to those of global network. """
     from_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, from_scope)
     to_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, to_scope)
     op_holder = []
@@ -51,15 +48,15 @@ def update_target_graph(from_scope, to_scope):
 
 # Processes PySC2 observations
 def process_observation(observation, action_spec):
-
+    """ Process an observation from the PySC2 Environment """
     episode_end = observation.step_type == environment.StepType.LAST
     reward = observation.reward
     features = observation.observation
-    variable_features = ['cargo', 'multi_select', 'build_queue']
+    """variable_features = ['cargo', 'multi_select', 'build_queue']
     max_no = {'available_actions': len(action_spec.functions),
               'cargo': 100,
               'multi_select': 100,
-              'build_queue': 10}
+              'build_queue': 10}"""
     nonspatial_stack = np.expand_dims(np.log(features['player'].reshape(-1) + 1.), axis=0)
     # spatial features
     minimap_channels = len(MINIMAP_FEATURES)
@@ -71,27 +68,20 @@ def process_observation(observation, action_spec):
     return reward, nonspatial_stack, minimap_stack, screen_stack, episode_end
 
 
-# Discounting function used to calculate discounted returns.
+
 def discount(x, gamma):
+    """ Discounting function used to calculate discounted returns. """
     return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
 
 
-# Used to initialize weights for policy and value output layers
-def normalized_columns_initializer(std=1.0):
-    def _initializer(shape, dtype=None, partition_info=None):
-        out = np.random.randn(*shape).astype(np.float32)
-        out *= std / np.sqrt(np.square(out).sum(axis=0, keepdims=True))
-        return tf.constant(out)
-    return _initializer
-
-
 def sample_dist(dist):
-    sample = np.random.choice(dist[0],p=dist[0])
+    """ Chooses a random index based on distribution. """
+    sample = np.random.choice(dist[0], p=dist[0])
     sample = np.argmax(dist == sample)
     return sample
 
 
-def initialize_environment(visualize=True):
+def initialize_environment(visualize=False):
     interface_format = sc2_env.AgentInterfaceFormat(
         feature_dimensions=sc2_env.Dimensions(screen=FLAGS.screen_resolution,
                                               minimap=FLAGS.minimap_resolution))
@@ -100,17 +90,17 @@ def initialize_environment(visualize=True):
                           visualize=visualize)
 
 
-## ACTOR-CRITIC NETWORK
+# ACTOR-CRITIC NETWORK
 
-class AC_Network():
-    def __init__(self, scope, trainer, action_spec, observation_spec):
+class ACNetwork:
+    def __init__(self, scope, trainer, action_spec):
         with tf.variable_scope(scope):
             # Architecture here follows Atari-net Agent described in [1] Section 4.3
             nonspatial_size = len(Player)
             minimap_channels = len(MINIMAP_FEATURES)
             screen_channels = len(SCREEN_FEATURES)
             minimap_shape = [None, FLAGS.minimap_resolution, FLAGS.minimap_resolution, minimap_channels]
-            screen_shape = [None, FLAGS.screen_resolution, FLAGS.minimap_resolution, screen_channels]
+            screen_shape = [None, FLAGS.screen_resolution, FLAGS.screen_resolution, screen_channels]
 
             self.inputs_nonspatial = tf.placeholder(shape=[None, nonspatial_size], dtype=tf.float32)
             self.inputs_spatial_minimap = tf.placeholder(shape=minimap_shape, dtype=tf.float32)
@@ -172,12 +162,18 @@ class AC_Network():
             #   - All modeled independently
             #   - Spatial arguments have the x and y values modeled independently as well
             # 1 value network
+
+            # We use separate nets for our spatial arguments below
             spatial_arguments = ['screen', 'minimap', 'screen2']
+
+            # Use a dense net to determine which base action to take
             self.policy_base_actions = tf.layers.dense(
                 inputs=self.latent_vector_nonspatial,
                 units=len(action_spec.functions._func_dict),
                 activation=tf.nn.softmax,
-                kernel_initializer=normalized_columns_initializer(0.01))
+                kernel_initializer=tf.contrib.layers.xavier_initializer(uniform=True, seed=0))
+
+            # For non-spatial actions, we determine what type of argument to use (e.g. queued, control-group actions)
             self.policy_arg_nonspatial = dict()
             for arg in action_spec.types:
                 if arg.name not in spatial_arguments:
@@ -187,35 +183,50 @@ class AC_Network():
                             inputs=self.latent_vector_nonspatial,
                             units=size,
                             activation=tf.nn.softmax,
-                            kernel_initializer=normalized_columns_initializer(1.0 if dim == 2 else 0.01),
+                            kernel_initializer=tf.contrib.layers.xavier_initializer(uniform=True, seed=0),
                             name="policy_dense_" + arg.name + "_" + str(dim))
+
+            # For spatial actions, we determine the coordinates on the screen/minimap to pass
             self.policy_arg_spatial = dict()
-            self.latent_vector_spatial = dict()
+            self.latent_vector_spatial_minimap = dict()
+            self.latent_vector_spatial_screen = dict()
             for arg in spatial_arguments:
-                self.latent_vector_spatial[arg] = tf.layers.conv2d(  #TODO: wtf is this, why join, needs same dim?
-                    inputs=tf.concat([self.screen_conv2, self.minimap_conv2], axis=3),
-                    filters=1,
-                    kernel_size=[1, 1],
-                    strides=[1, 1],
-                    padding='same',
-                    activation=None)
-                self.policy_arg_spatial[arg] = \
-                    tf.nn.softmax(tf.reshape(self.latent_vector_spatial[arg],
-                                             shape=[-1, FLAGS.screen_resolution * FLAGS.screen_resolution]))
+                if arg == 'minimap':
+                    self.latent_vector_spatial_minimap[arg] = tf.layers.conv2d(
+                        inputs=self.minimap_conv2,
+                        filters=1,
+                        kernel_size=[1, 1],
+                        strides=[1, 1],
+                        padding='same',
+                        activation=None)
+                    self.policy_arg_spatial[arg] = tf.nn.softmax(tf.reshape(self.latent_vector_spatial_minimap[arg],
+                                                                            shape=[-1, FLAGS.minimap_resolution ** 2]))
+                else:
+                    self.latent_vector_spatial_screen[arg] = tf.layers.conv2d(
+                        inputs=self.screen_conv2,
+                        filters=1,
+                        kernel_size=[1, 1],
+                        strides=[1, 1],
+                        padding='same',
+                        activation=None)
+                    self.policy_arg_spatial[arg] = tf.nn.softmax(tf.reshape(self.latent_vector_spatial_screen[arg],
+                                                                            shape=[-1, FLAGS.screen_resolution ** 2]))
+            # The value function is determined from all available information on the screen/minimap + player info
             self.value = tf.layers.dense(
                 inputs=self.latent_vector_nonspatial,
                 units=1,
-                kernel_initializer=normalized_columns_initializer(1.0))
+                kernel_initializer=tf.contrib.layers.xavier_initializer(uniform=True, seed=0))
 
             # Only the worker network need ops for loss functions and gradient updating.
             # calculates the losses
             # self.gradients - gradients of loss wrt local_vars
             # applies the gradients to update the global network
             if scope != 'global':
+                # We use one_hot to mask available actions / action type / spatial arguments
                 self.actions_base = tf.placeholder(shape=[None], dtype=tf.int32)
                 self.actions_onehot_base = tf.one_hot(
                     self.actions_base,
-                    len(action_spec.functions._func_dict),
+                    len(action_spec.functions._func_dict),  # total number of actions
                     dtype=tf.float32)
                 self.actions_arg = dict()
                 self.actions_onehot_arg = dict()
@@ -229,12 +240,18 @@ class AC_Network():
                             self.actions_onehot_arg[arg_name][dim] = tf.one_hot(
                                 self.actions_arg[arg_name][dim], size, dtype=tf.float32)
                 self.actions_arg_spatial = dict()
-                self.actions_onehot_arg_spatial = dict()
+                self.actions_onehot_arg_spatial_minimap = dict()
+                self.actions_onehot_arg_spatial_screen = dict()
                 for arg in spatial_arguments:
-                    self.actions_arg_spatial[arg] = tf.placeholder(shape=[None],dtype=tf.int32)
-                    self.actions_onehot_arg_spatial[arg] = tf.one_hot(self.actions_arg_spatial[arg],
-                                                                      FLAGS.screen_resolution * FLAGS.screen_resolution,
-                                                                      dtype=tf.float32)
+                    self.actions_arg_spatial[arg] = tf.placeholder(shape=[None], dtype=tf.int32)
+                    if arg == 'minimap':
+                        self.actions_onehot_arg_spatial_minimap[arg] = \
+                            tf.one_hot(self.actions_arg_spatial[arg], FLAGS.minimap_resolution ** 2, dtype=tf.float32)
+                    else:
+                        self.actions_onehot_arg_spatial_screen[arg] = \
+                            tf.one_hot(self.actions_arg_spatial[arg], FLAGS.screen_resolution ** 2, dtype=tf.float32)
+
+                # Value and advantage of actions
                 self.target_v = tf.placeholder(shape=[None], dtype=tf.float32)
                 self.advantages = tf.placeholder(shape=[None], dtype=tf.float32)
 
@@ -247,11 +264,13 @@ class AC_Network():
                             self.policy_arg_nonspatial[arg_name][dim] * self.actions_onehot_arg[arg_name][dim], [1])
                 self.responsible_outputs_arg_spatial = dict()
                 for arg in spatial_arguments:
+                    onehot = self.actions_onehot_arg_spatial_minimap[arg] if arg == 'minimap' else \
+                        self.actions_onehot_arg_spatial_screen[arg]
                     self.responsible_outputs_arg_spatial[arg] = tf.reduce_sum(
-                        self.policy_arg_spatial[arg] * self.actions_onehot_arg_spatial[arg], [1])
+                        self.policy_arg_spatial[arg] * onehot, [1])
 
                 # Loss functions
-                self.value_loss = 0.5 * tf.reduce_sum(tf.square(self.target_v - tf.reshape(self.value,[-1])))
+                self.value_loss = 0.5 * tf.reduce_sum(tf.square(self.target_v - tf.reshape(self.value, [-1])))
 
                 # avoid NaN with clipping when value in policy becomes zero
                 self.log_policy_base_actions = tf.log(tf.clip_by_value(self.policy_base_actions, 1e-20, 1.0))
@@ -281,11 +300,13 @@ class AC_Network():
                     self.policy_loss_arg[arg_name] = dict()
                     for dim in self.policy_arg_nonspatial[arg_name]:
                         self.policy_loss_arg[arg_name][dim] = - tf.reduce_sum(
-                            tf.log(tf.clip_by_value(self.responsible_outputs_arg[arg_name][dim], 1e-20, 1.0)) * self.advantages)
+                            tf.log(tf.clip_by_value(self.responsible_outputs_arg[arg_name][dim], 1e-20, 1.0)) *
+                            self.advantages)
                 self.policy_loss_arg_spatial = dict()
                 for arg in spatial_arguments:
                     self.policy_loss_arg_spatial[arg] = - tf.reduce_sum(
-                        tf.log(tf.clip_by_value(self.responsible_outputs_arg_spatial[arg], 1e-20, 1.0)) * self.advantages)
+                        tf.log(tf.clip_by_value(self.responsible_outputs_arg_spatial[arg], 1e-20, 1.0)) *
+                        self.advantages)
                 self.policy_loss = self.policy_loss_base
                 for arg_name in self.policy_arg_nonspatial:
                     for dim in self.policy_arg_nonspatial[arg_name]:
@@ -297,7 +318,7 @@ class AC_Network():
 
                 # Get gradients from local network using local losses
                 local_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope)
-                self.gradients = tf.gradients(self.loss,local_vars)
+                self.gradients = tf.gradients(self.loss, local_vars)
                 self.var_norms = tf.global_norm(local_vars)
                 grads, self.grad_norms = tf.clip_by_global_norm(self.gradients, 40.0)
 
@@ -326,7 +347,7 @@ class Worker:
         self.observation_spec = observation_spec
 
         # Create the local copy of the network and the tensorflow op to copy global parameters to local network
-        self.local_AC = AC_Network(self.name, trainer, action_spec, observation_spec)
+        self.local_AC = ACNetwork(self.name, trainer, action_spec)
         self.update_local_ops = update_target_graph('global', self.name)
 
         print('Initializing environment #{}...'.format(self.number))
@@ -341,10 +362,7 @@ class Worker:
         actions_args = rollout[:, 4]
         actions_args_spatial = rollout[:, 5]
         rewards = rollout[:, 6]
-        next_obs_minimap = rollout[:, 7]
-        next_obs_screen = rollout[:, 8]
-        next_obs_nonspatial = rollout[:, 9]
-        values = rollout[:, 11]
+        values = rollout[:, 7]
 
         actions_arg_stack = dict()
         for actions_arg in actions_args:
@@ -377,24 +395,21 @@ class Worker:
 
         nonspatial_stack = np.zeros((len(obs_nonspatial), nonspatial_size))
         for i in range(len(obs_nonspatial)):
-                nonspatial_stack[i, :] = obs_nonspatial[i]
+            nonspatial_stack[i, :] = obs_nonspatial[i]
 
         # Update the global network using gradients from loss
         # Generate network statistics to periodically save
 
         feed_dict = {
             self.local_AC.target_v : discounted_rewards,
-            self.local_AC.inputs_spatial_screen: np.stack(obs_screen).reshape(-1,
-                                                                              FLAGS.screen_resolution,
-                                                                              FLAGS.screen_resolution,
-                                                                              screen_channels),
-            self.local_AC.inputs_spatial_minimap: np.stack(obs_minimap).reshape(-1,
-                                                                                FLAGS.minimap_resolution,
-                                                                                FLAGS.minimap_resolution,
-                                                                                minimap_channels),
+            self.local_AC.inputs_spatial_screen:
+                np.stack(obs_screen).reshape(-1, FLAGS.screen_resolution, FLAGS.screen_resolution, screen_channels),
+            self.local_AC.inputs_spatial_minimap:
+                np.stack(obs_minimap).reshape(-1, FLAGS.minimap_resolution, FLAGS.minimap_resolution, minimap_channels),
             self.local_AC.inputs_nonspatial: nonspatial_stack,
             self.local_AC.actions_base: actions_base,
             self.local_AC.advantages: advantages}
+
         for arg_name in actions_arg_stack:
             for dim in actions_arg_stack[arg_name]:
                 feed_dict[self.local_AC.actions_arg[arg_name][dim]] = actions_arg_stack[arg_name][dim]
@@ -452,24 +467,31 @@ class Worker:
                     # Apply filter to remove unavailable actions and then re-normalize
                     base_action_dist[0] += 1e-20
                     for action_id, action in enumerate(base_action_dist[0]):
+                        if actions.FUNCTIONS.Move_screen.id in obs[0].observation['available_actions']:
+                            base_action_dist[0][actions.FUNCTIONS.Move_screen.id] = 10000000.0  # WE WANT TO MOVE IF WE CAN!
                         if action_id not in obs[0].observation['available_actions']:
                             base_action_dist[0][action_id] = 0.
                     base_action_dist[0] /= np.sum(base_action_dist[0])
 
+                    # Determine which action typ to execute
                     action_id = sample_dist(base_action_dist)
 
                     arg_sample = dict()
+                    arg_nonspatial_dist['queued'][0][0][0] = 1.0  # FIXME: queuing forbidden!
+                    arg_nonspatial_dist['queued'][0][0][1] = 0.0
                     for arg_name in arg_nonspatial_dist:
                         arg_sample[arg_name] = dict()
                         for dim in arg_nonspatial_dist[arg_name]:
                             arg_sample[arg_name][dim] = sample_dist(arg_nonspatial_dist[arg_name][dim])
+
                     arg_sample_spatial = dict()
                     arg_sample_spatial_abs = dict()
                     for arg in arg_spatial_dist:
                         arg_sample_spatial_abs[arg] = sample_dist(arg_spatial_dist[arg])
-                        RES = FLAGS.minimap_resolution if arg == 'minimap' else FLAGS.screen_resolution
-                        arg_sample_spatial[arg] = [arg_sample_spatial_abs[arg] % RES,
-                                                   arg_sample_spatial_abs[arg] / RES]
+                        res = FLAGS.minimap_resolution if arg == 'minimap' else FLAGS.screen_resolution
+                        x = int(arg_sample_spatial_abs[arg] / res)
+                        y = arg_sample_spatial_abs[arg] % res
+                        arg_sample_spatial[arg] = [y, x]  # TODO: this shit to x and y
 
                     arguments = []
                     spatial_arguments = ['screen', 'minimap', 'screen2']
@@ -493,6 +515,7 @@ class Worker:
                         if arg_name not in self.action_spec.functions[action_id].args:
                             arg_sample_spatial_abs[arg_name] = -1
 
+                    # Execute the action!
                     a = actions.FunctionCall(action_id, arguments)
                     obs = self.env.step(actions=[a])
                     r, nonspatial_stack, minimap_stack, screen_stack, episode_end = process_observation(
@@ -500,24 +523,13 @@ class Worker:
 
                     if not episode_end:
                         episode_frames.append(obs[0])
-                        s1_minimap = minimap_stack
-                        s1_screen = screen_stack
-                        s1_nonspatial = nonspatial_stack
-                    else:
-                        s1_minimap = s_minimap
-                        s1_screen = s_screen
-                        s1_nonspatial = s_nonspatial
 
                     # Append latest state to buffer
                     episode_buffer.append([s_minimap, s_screen, s_nonspatial, action_id, arg_sample,
-                                           arg_sample_spatial_abs, r, s1_minimap, s1_screen, s1_nonspatial,
-                                           episode_end, v[0, 0]])
+                                           arg_sample_spatial_abs, r, v[0, 0]])
                     episode_values.append(v[0, 0])
 
                     episode_reward += r
-                    s_minimap = s1_minimap
-                    s_screen = s1_screen
-                    s_nonspatial = s1_nonspatial
                     sess.run(self.increment_global_steps)
                     total_steps += 1
                     episode_step_count += 1
@@ -586,7 +598,7 @@ class Worker:
 
 
 def main():
-    max_episode_length = 300
+    max_episode_length = 30000
     gamma = .99 # discount rate for advantage estimation and reward discounting
     load_model = FLAGS.load_model
     model_path = 'C:/Users/Xtreme-G/Documents/A3C'
@@ -597,7 +609,7 @@ def main():
     _max_score = 0
     _running_avg_score = 0
 
-    print('Initializing temporary environment to retrieve action_spec, and observation_spec...')
+    print('Initializing temporary environment to retrieve action_spec...')
     temp_env = initialize_environment(False)
     action_spec = temp_env.action_spec()[0]
     observation_spec = temp_env.observation_spec()
@@ -612,9 +624,9 @@ def main():
         global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
         global_steps = tf.Variable(0, dtype=tf.int32, name='global_steps', trainable=False)
         trainer = tf.train.AdamOptimizer(learning_rate=3e-5)
-        master_network = AC_Network('global', None, action_spec, observation_spec)  # Generate global network
+        ACNetwork('global', None, action_spec)  # Generate global network
         if FLAGS.n_agents < 1:
-            num_workers = psutil.cpu_count() # Set workers to number of available CPU threads
+            num_workers = psutil.cpu_count()  # Set workers to number of available CPU threads
         else:
             num_workers = FLAGS.n_agents
         workers = []
@@ -638,8 +650,8 @@ def main():
         for worker in workers:
             t = threading.Thread(target=lambda: worker.work(max_episode_length, gamma, sess, coord, saver))
             t.start()
-            sleep(0.5)
-            sleep(1.5)
+            #sleep(0.5)
+            #sleep(1.5)
             worker_threads.append(t)
         coord.join(worker_threads)
 
@@ -676,11 +688,11 @@ if __name__ == '__main__':
         help="Bot's strength.")
     flags.DEFINE_integer(
         "screen_resolution",
-        default=64,
+        default=16,
         help="Resolution for screen feature layers.")
     flags.DEFINE_integer(
         "minimap_resolution",
-        default=64,
+        default=8,
         help="Resolution for minimap feature layers.")
     flags.DEFINE_integer(
         "summary_interval",
